@@ -1,0 +1,143 @@
+name: PR size check
+
+on:
+  workflow_call:
+    inputs:
+      limit:
+        description: "Порог изменённых строк (additions + deletions) без исключённых файлов"
+        required: false
+        type: number
+        default: 400
+      extra_exclude:
+        description: "Дополнительные glob-паттерны для исключения (через перевод строки или пробел)"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  pr-size:
+    name: Проверка размера PR
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' || github.event_name == 'pull_request_target'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Подсчёт изменённых строк
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          LIMIT: ${{ inputs.limit }}
+          EXTRA_EXCLUDE: ${{ inputs.extra_exclude }}
+        run: |
+          set -euo pipefail
+
+          LIMIT="${LIMIT:-400}"
+          EXTRA_EXCLUDE="${EXTRA_EXCLUDE:-}"
+          PR_BODY="${PR_BODY:-}"
+
+          if ! [[ "$LIMIT" =~ ^[0-9]+$ ]]; then
+            echo "::warning title=Некорректный лимит::Значение limit='$LIMIT' не является целым числом; используется 400."
+            LIMIT=400
+          fi
+
+          if ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+            git fetch --no-tags origin "$BASE_SHA"
+          fi
+          if ! git cat-file -e "${HEAD_SHA}^{commit}" 2>/dev/null; then
+            git fetch --no-tags origin "$HEAD_SHA"
+          fi
+
+          DEFAULT_EXCLUDES=(
+            "tests/**"
+            "testdata/**"
+            "**/*_test.cpp"
+            "**/*.spec.ts"
+            "e2e/**"
+            "**/stub*"
+            "**/stub*/**"
+            "**/mocks/**"
+            "**/fixtures/**"
+            "**/package-lock.json"
+            "**/yarn.lock"
+            "**/pnpm-lock.yaml"
+            "**/src/test/**"
+            "**/*.pb.cc"
+            "**/*.pb.h"
+            "**/*.grpc.pb.cc"
+            "**/*.grpc.pb.h"
+            "**/generated/**"
+            "**/*.md"
+          )
+
+          PATHSPECS=(.)
+          for pat in "${DEFAULT_EXCLUDES[@]}"; do
+            PATHSPECS+=(":(exclude,glob)${pat}")
+          done
+
+          if [[ -n "$EXTRA_EXCLUDE" ]]; then
+            while IFS= read -r token; do
+              [[ -z "$token" ]] && continue
+              PATHSPECS+=(":(exclude,glob)${token}")
+            done < <(printf '%s\n' "$EXTRA_EXCLUDE" | tr -s '[:space:]' '\n')
+          fi
+
+          DIFF_OUT="$(git diff --numstat "${BASE_SHA}...${HEAD_SHA}" -- "${PATHSPECS[@]}")"
+          TOTAL_ALL="$(git diff --numstat "${BASE_SHA}...${HEAD_SHA}" | awk -F'\t' '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ { s += $1 + $2 } END { print s + 0 }')"
+          COUNTED="$(printf '%s\n' "$DIFF_OUT" | awk -F'\t' '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ { s += $1 + $2 } END { print s + 0 }')"
+          EXCLUDED=$(( TOTAL_ALL - COUNTED ))
+
+          REASON_LINE="$(printf '%s\n' "$PR_BODY" | tr -d '\r' | grep -E '^[[:space:]]*Почему не разбит:' | head -n 1 || true)"
+          HAS_REASON=0
+          if [[ -n "$REASON_LINE" ]]; then
+            REASON_VAL="${REASON_LINE#*:}"
+            REASON_VAL="$(printf '%s' "$REASON_VAL" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            if [[ -n "$REASON_VAL" ]] && ! [[ "$REASON_VAL" =~ ^\<.*\>$ ]]; then
+              HAS_REASON=1
+            fi
+          fi
+
+          {
+            echo "### Размер PR (режим наблюдения)"
+            echo ""
+            echo "- Учтено строк (без тестов, фикстур, стабов, локов, генерации и документации): **${COUNTED}** (лимит: **${LIMIT}**)"
+            echo "- Исключено строк: ${EXCLUDED} (всего в PR: ${TOTAL_ALL})"
+            if (( COUNTED > LIMIT )); then
+              if (( HAS_REASON == 1 )); then
+                echo "- Статус: превышен лимит, обоснование «Почему не разбит:» указано."
+              else
+                echo "- Статус: превышен лимит, в описании PR нет строки «Почему не разбит:»."
+              fi
+              if [[ -n "$DIFF_OUT" ]]; then
+                echo ""
+                echo "<details><summary>Учтённые файлы (топ-15)</summary>"
+                echo ""
+                echo "| +/- | Файл |"
+                echo "|---:|---|"
+                printf '%s\n' "$DIFF_OUT" \
+                  | awk -F'\t' '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ { printf "%d\t%s\n", $1 + $2, $3 }' \
+                  | sort -rn \
+                  | head -n 15 \
+                  | awk -F'\t' '{ printf "| %s | `%s` |\n", $1, $2 }'
+                echo ""
+                echo "</details>"
+              fi
+            else
+              echo "- Статус: в пределах лимита."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if (( COUNTED > LIMIT )); then
+            if (( HAS_REASON == 1 )); then
+              echo "::warning title=Крупный PR::Изменено ${COUNTED} строк (лимит ${LIMIT}, без тестов и исключённых файлов). Обоснование «Почему не разбит:» указано."
+            else
+              echo "::warning title=Крупный PR::Изменено ${COUNTED} строк (лимит ${LIMIT}, без тестов и исключённых файлов). В описании PR нет строки «Почему не разбит: <причина>»."
+            fi
+          fi
